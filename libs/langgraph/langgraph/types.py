@@ -101,7 +101,10 @@ def default_retry_on(exc: Exception) -> bool:
 
 
 class RetryPolicy(NamedTuple):
-    """Configuration for retrying nodes."""
+    """Configuration for retrying nodes.
+
+    !!! version-added "Added in version 0.2.24."
+    """
 
     initial_interval: float = 0.5
     """Amount of time that must elapse before the first retry occurs. In seconds."""
@@ -120,13 +123,20 @@ class RetryPolicy(NamedTuple):
 
 
 class CachePolicy(NamedTuple):
-    """Configuration for caching nodes."""
+    """Configuration for caching nodes.
+
+    !!! version-added "Added in version 0.2.24."
+    """
 
     pass
 
 
 @dataclasses.dataclass(**_DC_KWARGS)
 class Interrupt:
+    """
+    !!! version-added "Added in version 0.2.24."
+    """
+
     value: Any
     resumable: bool = False
     ns: Optional[Sequence[str]] = None
@@ -148,7 +158,14 @@ class PregelTask(NamedTuple):
     result: Optional[Any] = None
 
 
-class PregelExecutableTask(NamedTuple):
+if sys.version_info > (3, 11):
+    _T_DC_KWARGS = {"weakref_slot": True, "slots": True, "frozen": True}
+else:
+    _T_DC_KWARGS = {"frozen": True}
+
+
+@dataclasses.dataclass(**_T_DC_KWARGS)
+class PregelExecutableTask:
     name: str
     input: Any
     proc: Runnable
@@ -260,6 +277,8 @@ N = TypeVar("N", bound=Hashable)
 @dataclasses.dataclass(**_DC_KWARGS)
 class Command(Generic[N], ToolOutputMixin):
     """One or more commands to update the graph's state and send messages to nodes.
+
+    !!! version-added "Added in version 0.2.24."
 
     Args:
         graph: graph to send the command to. Supported values are:

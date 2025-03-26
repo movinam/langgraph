@@ -23,6 +23,7 @@ from typing import (
 from langchain_core.callbacks import Callbacks
 from langchain_core.callbacks.manager import AsyncParentRunManager, ParentRunManager
 from langchain_core.runnables.config import RunnableConfig
+from xxhash import xxh3_128_hexdigest
 
 from langgraph.channels.base import BaseChannel
 from langgraph.checkpoint.base import (
@@ -233,10 +234,21 @@ def apply_writes(
     channels: Mapping[str, BaseChannel],
     tasks: Iterable[WritesProtocol],
     get_next_version: Optional[GetNextVersion],
-) -> dict[str, list[Any]]:
+) -> tuple[dict[str, list[Any]], set[str]]:
     """Apply writes from a set of tasks (usually the tasks from a Pregel step)
     to the checkpoint and channels, and return managed values writes to be applied
-    externally."""
+    externally.
+
+    Args:
+        checkpoint: The checkpoint to update.
+        channels: The channels to update.
+        tasks: The tasks to apply writes from.
+        get_next_version: Optional function to determine the next version of a channel.
+
+    Returns:
+        A tuple containing the managed values writes to be applied externally, and
+        the set of channels that were updated in this step.
+    """
     # sort tasks on path, to ensure deterministic order for update application
     # any path parts after the 3rd are ignored for sorting
     # (we use them for eg. task ids which aren't good for sorting)
@@ -312,15 +324,14 @@ def apply_writes(
     # Channels that weren't updated in this step are notified of a new step
     if bump_step:
         for chan in channels:
-            if chan not in updated_channels:
-                if channels[chan].update([]) and get_next_version is not None:
+            if channels[chan].is_available() and chan not in updated_channels:
+                if channels[chan].update(EMPTY_SEQ) and get_next_version is not None:
                     checkpoint["channel_versions"][chan] = get_next_version(
                         max_version,
                         channels[chan],
                     )
-
     # Return managed values writes to be applied externally
-    return pending_writes_by_managed
+    return pending_writes_by_managed, updated_channels
 
 
 @overload
@@ -337,6 +348,8 @@ def prepare_next_tasks(
     store: Literal[None] = None,
     checkpointer: Literal[None] = None,
     manager: Literal[None] = None,
+    trigger_to_nodes: Optional[Mapping[str, Sequence[str]]] = None,
+    updated_channels: Optional[set[str]] = None,
 ) -> dict[str, PregelTask]: ...
 
 
@@ -354,6 +367,8 @@ def prepare_next_tasks(
     store: Optional[BaseStore],
     checkpointer: Optional[BaseCheckpointSaver],
     manager: Union[None, ParentRunManager, AsyncParentRunManager],
+    trigger_to_nodes: Optional[Mapping[str, Sequence[str]]] = None,
+    updated_channels: Optional[set[str]] = None,
 ) -> dict[str, PregelExecutableTask]: ...
 
 
@@ -370,10 +385,35 @@ def prepare_next_tasks(
     store: Optional[BaseStore] = None,
     checkpointer: Optional[BaseCheckpointSaver] = None,
     manager: Union[None, ParentRunManager, AsyncParentRunManager] = None,
+    trigger_to_nodes: Optional[Mapping[str, Sequence[str]]] = None,
+    updated_channels: Optional[set[str]] = None,
 ) -> Union[dict[str, PregelTask], dict[str, PregelExecutableTask]]:
     """Prepare the set of tasks that will make up the next Pregel step.
-    This is the union of all PUSH tasks (Sends) and PULL tasks (nodes triggered
-    by edges)."""
+
+    Args:
+        checkpoint: The current checkpoint.
+        pending_writes: The list of pending writes.
+        processes: The mapping of process names to PregelNode instances.
+        channels: The mapping of channel names to BaseChannel instances.
+        managed: The mapping of managed value names to functions.
+        config: The runnable configuration.
+        step: The current step.
+        for_execution: Whether the tasks are being prepared for execution.
+        store: An instance of BaseStore to make it available for usage within tasks.
+        checkpointer: Checkpointer instance used for saving checkpoints.
+        manager: The parent run manager to use for the tasks.
+        trigger_to_nodes: Optional: Mapping of channel names to the set of nodes
+            that are can be triggered by that channel.
+        updated_channels: Optional. Set of channel names that have been updated during
+            the previous step. Using in conjunction with trigger_to_nodes to speed
+            up the process of determining which nodes should be triggered in the next
+            step.
+
+    Returns:
+        A dictionary of tasks to be executed. The keys are the task ids and the values
+        are the tasks themselves. This is the union of all PUSH tasks (Sends)
+        and PULL tasks (nodes triggered by edges).
+    """
     checkpoint_id_bytes = binascii.unhexlify(checkpoint["id"].replace("-", ""))
     null_version = checkpoint_null_version(checkpoint)
     tasks: list[Union[PregelTask, PregelExecutableTask]] = []
@@ -397,9 +437,30 @@ def prepare_next_tasks(
             manager=manager,
         ):
             tasks.append(task)
+
+    # This section is an optimization that allows which nodes will be active
+    # during the next step.
+    # When there's information about:
+    # 1. Which channels were updated in the previous step
+    # 2. Which nodes are triggered by which channels
+    # Then we can determine which nodes should be triggered in the next step
+    # without having to cycle through all nodes.
+    if updated_channels and trigger_to_nodes:
+        triggered_nodes: set[str] = set()
+        # Get all nodes that have triggers associated with an updated channel
+        for channel in updated_channels:
+            if node_ids := trigger_to_nodes.get(channel):
+                triggered_nodes.update(node_ids)
+        # Sort the nodes to ensure deterministic order
+        candidate_nodes: Iterable[str] = sorted(triggered_nodes)
+    elif not checkpoint["channel_versions"]:
+        candidate_nodes = ()
+    else:
+        candidate_nodes = processes.keys()
+
     # Check if any processes should be run in next step
     # If so, prepare the values to be passed to them
-    for name in processes:
+    for name in candidate_nodes:
         if task := prepare_single_task(
             (PULL, name),
             None,
@@ -446,6 +507,7 @@ def prepare_single_task(
     uniquely identifies a PUSH or PULL task within the graph."""
     configurable = config.get(CONF, {})
     parent_ns = configurable.get(CONFIG_KEY_CHECKPOINT_NS, "")
+    task_id_func = _xxhash_str if checkpoint["v"] > 1 else _uuid5_str
 
     if task_path[0] == PUSH and isinstance(task_path[-1], Call):
         # (PUSH, parent task path, idx of PUSH write, id of parent task, Call)
@@ -458,7 +520,7 @@ def prepare_single_task(
         # create task id
         triggers: Sequence[str] = PUSH_TRIGGER
         checkpoint_ns = f"{parent_ns}{NS_SEP}{name}" if parent_ns else name
-        task_id = _uuid5_str(
+        task_id = task_id_func(
             checkpoint_id_bytes,
             checkpoint_ns,
             str(step),
@@ -554,7 +616,7 @@ def prepare_single_task(
             checkpoint_ns = (
                 f"{parent_ns}{NS_SEP}{packet.node}" if parent_ns else packet.node
             )
-            task_id = _uuid5_str(
+            task_id = task_id_func(
                 checkpoint_id_bytes,
                 checkpoint_ns,
                 str(step),
@@ -678,7 +740,7 @@ def prepare_single_task(
 
             # create task id
             checkpoint_ns = f"{parent_ns}{NS_SEP}{name}" if parent_ns else name
-            task_id = _uuid5_str(
+            task_id = task_id_func(
                 checkpoint_id_bytes,
                 checkpoint_ns,
                 str(step),
@@ -888,11 +950,17 @@ def _proc_input(
 
 
 def _uuid5_str(namespace: bytes, *parts: str) -> str:
-    """Generate a UUID from the SHA-1 hash of a namespace UUID and a name."""
+    """Generate a UUID from the SHA-1 hash of a namespace and str parts."""
 
     sha = sha1(namespace, usedforsecurity=False)
     sha.update(b"".join(p.encode() for p in parts))
     hex = sha.hexdigest()
+    return f"{hex[:8]}-{hex[8:12]}-{hex[12:16]}-{hex[16:20]}-{hex[20:32]}"
+
+
+def _xxhash_str(namespace: bytes, *parts: str) -> str:
+    """Generate a UUID from the XXH3 hash of a namespace and str parts."""
+    hex = xxh3_128_hexdigest(namespace + b"".join(p.encode() for p in parts))
     return f"{hex[:8]}-{hex[8:12]}-{hex[12:16]}-{hex[16:20]}-{hex[20:32]}"
 
 
